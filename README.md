@@ -1,6 +1,7 @@
 # TInjector
 
 劫持Zygote实现App启动前注入so
+![1](https://github.com/Mrack/TInjector/assets/15072171/b6afd749-55c8-4a9b-872a-4001fd3772fa)
 
 ## Features
 - Zygote spawn模式
