@@ -22,6 +22,16 @@
 #define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__))
 
+#define HANDLE_EINTR(x) ({ \
+    int eintr_count = 0;  \
+    decltype(x) __result; \
+    do { \
+        __result = (x); \
+    } while (__result == -1 && errno == EINTR && eintr_count++ < 20); \
+    __result; \
+})
+
+
 void *android_os_Process_setArg = nullptr;
 void *selinux_android_setcontext = nullptr;
 char *need_inject_pkg = nullptr;
@@ -33,7 +43,7 @@ void send_msg() {
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        perror("socket");
+        LOGD("%s", strerror(errno));
         exit(1);
     }
 
@@ -47,12 +57,12 @@ void send_msg() {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
-        perror("inet_pton");
+        LOGD("inet_pton: %s", strerror(errno));
         exit(1);
     }
 
-    if (connect(sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
+    if (HANDLE_EINTR(connect(sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr))) < 0) {
+        LOGD("connect: %s", strerror(errno));
         exit(1);
     }
 
@@ -67,13 +77,13 @@ void send_msg() {
 
     size_t len = strlen(message);
 
-    if (send(sockfd, &len, sizeof(size_t), 0) < 0) {
-        perror("send");
+    if (HANDLE_EINTR(send(sockfd, &len, sizeof(size_t), 0)) < 0) {
+        LOGD("send: %s", strerror(errno));
         exit(1);
     }
 
-    if (send(sockfd, message, strlen(message), 0) < 0) {
-        perror("send");
+    if (HANDLE_EINTR(send(sockfd, message, strlen(message), 0)) < 0) {
+        LOGD("send: %s", strerror(errno));
         exit(1);
     }
 
@@ -150,6 +160,13 @@ void ainject(const char *pkg, const char *so_path) {
     need_inject_pkg = strdup(pkg);
     need_inject_so = strdup(so_path);
     LOGD("ainject: %s %s", need_inject_pkg, need_inject_so);
+
+    char *byte = reinterpret_cast<char *>(fork);
+    if (byte[1] == 0x00 && byte[2] == 0x00 && byte[3] == 0x58 && byte[4] == 0x00 &&
+        byte[5] == 0x02 && byte[6] == 0x1f && byte[7] == 0xd6) {
+        LOGD("fork is hooked");
+        return;
+    }
     install_hook_fork((void *) fork);
 }
 

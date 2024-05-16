@@ -45,11 +45,97 @@
 #define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__))
 
 
+#define HANDLE_EINTR(x) ({ \
+    int eintr_count = 0;  \
+    decltype(x) __result; \
+    do { \
+        __result = (x); \
+    } while (__result == -1 && errno == EINTR && eintr_count++ < 20); \
+    __result; \
+})
+
+
 int g_pid = -1;
 const char *g_so_path = nullptr;
 bool g_hide = false;
 bool g_spawn = false;
 const char *g_package_name = nullptr;
+
+long get_module_base(pid_t pid, const char *module_name) {
+    long base_addr_long = 0;
+    char *file_name = (char *) calloc(50, sizeof(char));
+    if (pid == -1) {
+        snprintf(file_name, 50, "/proc/self/maps");
+    } else {
+        snprintf(file_name, 50, "/proc/%d/maps", pid);
+    }
+    FILE *fp = fopen(file_name, "r");
+    free(file_name);
+    char line[512];
+    if (fp != nullptr) {
+        while (fgets(line, 512, fp) != nullptr) {
+            if (strstr(line, module_name)) {
+                char *p = strtok(line, "-");
+                base_addr_long = strtoul(p, nullptr, 16);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    return base_addr_long;
+}
+
+const char *get_module_name(pid_t pid, uintptr_t addr) {
+    char filepath[256];
+
+    if (pid == -1) {
+        snprintf(filepath, sizeof(filepath), "/proc/self/maps");
+    } else {
+        snprintf(filepath, sizeof(filepath), "/proc/%d/maps", pid);
+    }
+
+    FILE *mapsFile = fopen(filepath, "r");
+    if (!mapsFile) {
+        return "";
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), mapsFile)) {
+        uintptr_t startAddr, endAddr;
+        sscanf(line, "%lx-%lx", &startAddr, &endAddr);
+
+        if (addr >= startAddr && addr <= endAddr) {
+            char *libPath = strchr(line, '/');
+            if (libPath) {
+                char *newline = strchr(libPath, '\n');
+                if (newline) {
+                    *newline = '\0';
+                }
+                fclose(mapsFile);
+                return strdup(libPath);
+            }
+        }
+    }
+
+    fclose(mapsFile);
+    return "";
+}
+
+long get_remote_addr(int pid, void *func) {
+    const char *module = get_module_name(-1, (uintptr_t) func);
+    long local_base = get_module_base(-1, module);
+    long remote_base = get_module_base(pid, module);
+    long remote_addr = (long) func - local_base + remote_base;
+
+    LOGD("module: %s, local_base: %lx, remote_base: %lx", module, local_base, remote_base);
+
+    if (!local_base || !remote_base) {
+        LOGE("get module base failed.");
+        exit(-1);
+    }
+    return remote_addr;
+}
+
 
 bool setenforce(bool value) {
     int ret = system(value ? "setenforce 1" : "setenforce 0");
@@ -84,29 +170,6 @@ int get_pid(const char *process_name) {
     return -1;
 }
 
-long get_module_base(pid_t pid, const char *module_name) {
-    long base_addr_long = 0;
-    char *file_name = (char *) calloc(50, sizeof(char));
-    if (pid == -1) {
-        snprintf(file_name, 50, "/proc/self/maps");
-    } else {
-        snprintf(file_name, 50, "/proc/%d/maps", pid);
-    }
-    FILE *fp = fopen(file_name, "r");
-    free(file_name);
-    char line[512];
-    if (fp != nullptr) {
-        while (fgets(line, 512, fp) != nullptr) {
-            if (strstr(line, module_name)) {
-                char *p = strtok(line, "-");
-                base_addr_long = strtoul(p, nullptr, 16);
-                break;
-            }
-        }
-        fclose(fp);
-    }
-    return base_addr_long;
-}
 
 long xptrace(int __request, ...) {
     va_list args;
@@ -224,68 +287,13 @@ Ret call_remote_call(int pid, long address, int argc, long *args) {
     }
 }
 
-const char *get_module_name(pid_t pid, uintptr_t addr) {
-    char filepath[256];
-
-    if (pid == -1) {
-        snprintf(filepath, sizeof(filepath), "/proc/self/maps");
-    } else {
-        snprintf(filepath, sizeof(filepath), "/proc/%d/maps", pid);
-    }
-
-    FILE *mapsFile = fopen(filepath, "r");
-    if (!mapsFile) {
-        return "";
-    }
-
-    char line[1024];
-    while (fgets(line, sizeof(line), mapsFile)) {
-        uintptr_t startAddr, endAddr;
-        sscanf(line, "%lx-%lx", &startAddr, &endAddr);
-
-        if (addr >= startAddr && addr <= endAddr) {
-            char *libPath = strchr(line, '/');
-            if (libPath) {
-                char *newline = strchr(libPath, '\n');
-                if (newline) {
-                    *newline = '\0';
-                }
-                fclose(mapsFile);
-                return strdup(libPath);
-            }
-        }
-    }
-
-    fclose(mapsFile);
-    return "";
-}
-
 template<typename Ret, typename... Args>
 Ret call_remote_function(Ret (*func)(Args...), int pid, Args... args) {
-    const char *module_name = get_module_name(-1, (uintptr_t) func);
-    long local_base = get_module_base(-1, module_name);
-    long remote_base = get_module_base(pid, module_name);
-
-    LOGD("module: %s, local_base: %lx, remote_base: %lx", module_name, local_base, remote_base);
-
-    if (!local_base || !remote_base) {
-        LOGE("get module base failed.");
-        exit(-1);
-    }
-
-    long remote_addr = (long) func - local_base + remote_base;
+    long remote_addr = get_remote_addr(pid, (void *) func);
     long params[sizeof...(Args)];
     int index = 0;
     ((params[index++] = (long) args), ...);
     return Ret(call_remote_call<Ret>(pid, remote_addr, sizeof(params) / sizeof(long), params));
-}
-
-long get_remote_addr(void *func, int pid) {
-    const char *module = get_module_name(-1, (uintptr_t) func);
-    long local_base = get_module_base(-1, module);
-    long remote_base = get_module_base(pid, module);
-    long remote_addr = (long) func - local_base + remote_base;
-    return remote_addr;
 }
 
 void *alloc_str(int pid, const char *str) {
@@ -368,7 +376,7 @@ void hide_module(pid_t pid, const char *module_name) {
 #endif
         }
 
-        long addr = get_remote_addr((void *) mremap, pid);
+        long addr = get_remote_addr(pid, (void *) mremap);
 
         long params[] = {(long) map, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, (long) address};
         call_remote_call<void>(pid, addr, sizeof(params) / sizeof(size_t), params);
@@ -386,7 +394,7 @@ void run_server(std::promise<int> &promiseObj) {
     ssize_t totalBytesReceived = 0;
 
     struct pack {
-        int length;
+        size_t length;
         char *data;
     } pack{};
 
@@ -409,24 +417,24 @@ void run_server(std::promise<int> &promiseObj) {
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof(timeout));
 
-    if (bind(sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
+    if (HANDLE_EINTR(bind(sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr))) < 0) {
         perror("bind");
         goto err;
     }
 
-    if (listen(sockfd, 1) < 0) {
+    if (HANDLE_EINTR(listen(sockfd, 1)) < 0) {
         perror("listen");
         goto err;
     }
 
     client_len = sizeof(client_addr);
-    newsockfd = accept(sockfd, (struct sockaddr *) &client_addr, &client_len);
+    newsockfd = HANDLE_EINTR(accept(sockfd, (struct sockaddr *) &client_addr, &client_len));
     if (newsockfd < 0) {
         perror("accept");
         goto err;
     }
 
-    if (recv(newsockfd, &pack.length, sizeof(pack.length), 0) < 0) {
+    if (HANDLE_EINTR(recv(newsockfd, &pack.length, sizeof(pack.length), 0)) < 0) {
         perror("recv");
         goto err;
     }
@@ -434,7 +442,8 @@ void run_server(std::promise<int> &promiseObj) {
     pack.data = new char[pack.length];
 
     while (true) {
-        ssize_t numBytesReceived = recv(newsockfd, pack.data + totalBytesReceived, pack.length - totalBytesReceived, 0);
+        ssize_t numBytesReceived = HANDLE_EINTR(
+                recv(newsockfd, pack.data + totalBytesReceived, pack.length - totalBytesReceived, 0));
         if (numBytesReceived > 0) {
             totalBytesReceived += numBytesReceived;
         } else if (totalBytesReceived >= pack.length) {
@@ -461,6 +470,7 @@ void run_server(std::promise<int> &promiseObj) {
 }
 
 void inject_module() {
+    kill(g_pid, SIGCONT);
     xptrace(PTRACE_ATTACH, g_pid, NULL, NULL);
     waitpid(g_pid, nullptr, WUNTRACED);
 
@@ -471,6 +481,18 @@ void inject_module() {
         if (getcwd(currentPath, sizeof(currentPath)) != nullptr) {
             temp_buffer = std::string(currentPath) + "/libtcore.so";
             path = temp_buffer.c_str();
+        }
+
+        long addr = get_remote_addr(g_pid, (void *) fork);
+        uint8_t bytes[8] = {0};
+        ptrace_read(g_pid, addr, bytes, 8);
+        LOGD("fork: %lx %lx %lx %lx %lx %lx %lx %lx", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+             bytes[6], bytes[7]);
+        //50 00 00 58 00 02 1f d6
+        if (bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x58 &&
+            bytes[4] == 0x00 && bytes[5] == 0x02 && bytes[6] == 0x1f && bytes[7] == 0xd6) {
+            LOGE("Inject failed. Please disable frida server or another hook tool.");
+            return;
         }
     }
 
@@ -519,14 +541,13 @@ void inject_module() {
 
     xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
     if (g_spawn) {
+        std::promise<int> promiseObj;
+        std::thread serv(run_server, std::ref(promiseObj));
         system(std::string("am force-stop ").append(g_package_name).c_str());
         system(std::string("am start -D $(cmd package resolve-activity --brief '").append(g_package_name).append(
                 "'| tail -n 1)").c_str());
-
-        std::promise<int> promiseObj;
-        std::thread serv(run_server, std::ref(promiseObj));
-        LOGD("Waiting for client connection...");
         serv.join();
+        LOGD("Waiting for client connection...");
         int child_pid = promiseObj.get_future().get();
         if (child_pid > 0) {
             if (g_hide) {
@@ -536,24 +557,26 @@ void inject_module() {
                 xptrace(PTRACE_DETACH, child_pid, NULL, NULL);
             }
 
-            // 释放资源
-            xptrace(PTRACE_ATTACH, g_pid, NULL, NULL);
-            void *sym_name = alloc_str(g_pid, "unload");
-            auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
-                                                                                                     handle,
-                                                                                                     (const char *) sym_name);
-            if (fun) {
-                call_remote_call<void>(g_pid, (long) fun, 0, nullptr);
-            }
-            call_remote_function<void, void *>(free, g_pid, sym_name);
-
-            call_remote_function<int, void *>(dlclose, g_pid, handle);
-            xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
-
             LOGI("Inject success.");
-        } else {
-            LOGE("Inject failed. Failed to get child pid.");
+        } else if (child_pid == -1) {
+            LOGE("Inject failed. Failed to connect to client.");
         }
+
+
+
+        // 释放资源
+        kill(g_pid, SIGCONT);
+        xptrace(PTRACE_ATTACH, g_pid, NULL, NULL);
+        void *sym_name = alloc_str(g_pid, "unload");
+        auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
+                                                                                                 handle,
+                                                                                                 (const char *) sym_name);
+        if (fun) {
+            call_remote_call<void>(g_pid, (long) fun, 0, nullptr);
+        }
+        call_remote_function<void, void *>(free, g_pid, sym_name);
+        call_remote_function<int, void *>(dlclose, g_pid, handle);
+        xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
     }
 
 }
