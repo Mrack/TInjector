@@ -486,7 +486,7 @@ void inject_module() {
         long addr = get_remote_addr(g_pid, (void *) fork);
         uint8_t bytes[8] = {0};
         ptrace_read(g_pid, addr, bytes, 8);
-        LOGD("fork: %lx %lx %lx %lx %lx %lx %lx %lx", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+        LOGD("fork: %hhx %hhx %hhx %hhx %hhx %hhx %hhx %hhx", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
              bytes[6], bytes[7]);
         //50 00 00 58 00 02 1f d6
         if (bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x58 &&
