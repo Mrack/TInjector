@@ -7,7 +7,9 @@
 - Zygote spawn模式
 - Android 9 - 13
 - Arm64-v8a
-- Remap 隐藏 so
+- remap 隐藏 so
+- 移除elf头 隐藏 so
+- soinfo 隐藏 so
 
 ## TODO
 - 支持usap模式
@@ -31,11 +33,12 @@ Build:
   chmod +x tinjector
   ./tinjector -h
   
-  Usage: ./tinject --hide -f -p <package name>  <so path>
+  Usage: ./tinject --hide --hide1 -f -p <package name>  <so path>
   Options:
   -p <pkg> <so path>  Inject so to the specified package.
   -P <pid> <so path>  Inject so to the specified pid.
   --hide              Hide the injected module.
+  --hide1             Hide the injected module. (soinfo) beta
   -h                  Show this help.
   -f                  Spwan a new process and inject to it. only for android app.
   ```

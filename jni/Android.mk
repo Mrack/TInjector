@@ -26,7 +26,7 @@ include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := tcore
-LOCAL_SRC_FILES := core/core.cpp core/utils.cpp
+LOCAL_SRC_FILES := core/core.cpp core/utils.cpp core/hide.cpp
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/core $(LOCAL_PATH)
 LOCAL_CPPFLAGS := -Os -std=c++17 -Werror=format -fdata-sections -ffunction-sections -fvisibility=hidden -Wl,--exclude-libs,ALL
 LOCAL_LDLIBS := -llog

@@ -9,6 +9,12 @@
 #include <android/log.h>
 #include <jni.h>
 
+
+#define TAG "TInjectCore"
+#define LOGD(...) ((void)__android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__))
+#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__))
+#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__))
+
 #define ANDROID_O 26
 #define ANDROID_O2 27
 #define ANDROID_P 28

@@ -11,23 +11,19 @@
 #include <vector>
 #include "dobby/dobby.h"
 #include "json.hpp"
+#include "hide.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #define PORT 56832
 
-#define TAG "TInjectCore"
-#define LOGD(...) ((void)__android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__))
-#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__))
-#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__))
-
 #define HANDLE_EINTR(x) ({ \
     int eintr_count = 0;  \
     decltype(x) __result; \
     do { \
         __result = (x); \
-    } while (__result == -1 && errno == EINTR && eintr_count++ < 20); \
+    } while (__result == -1 && errno == EINTR && eintr_count++ < 100); \
     __result; \
 })
 
@@ -36,6 +32,7 @@ void *android_os_Process_setArg = nullptr;
 void *selinux_android_setcontext = nullptr;
 char *need_inject_pkg = nullptr;
 char *need_inject_so = nullptr;
+bool is_hide = false;
 
 void send_msg() {
     int sockfd;
@@ -95,19 +92,26 @@ install_hook_name(selinux_android_setcontext, int, uid_t uid, bool isSystemServe
     int res = orig_selinux_android_setcontext(uid, isSystemServer, seinfo, name);
     if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(name, need_inject_pkg) == 0) {
         LOGD("pkgName: %s", name);
-        void *handle = dlopen(need_inject_so, RTLD_NOW);
+        void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
-            return res;
         } else {
             LOGD("inject so: %s", need_inject_so);
             send_msg();
+            if (is_hide) {
+                hide_soinfo(need_inject_so);
+                print_soinfos();
+            }
         }
     }
 
     DobbyDestroy(selinux_android_setcontext);
     DobbyDestroy(android_os_Process_setArg);
     dlclose(dlopen(nullptr, RTLD_NOW));
+    if (is_hide) {
+        hide_soinfo("libtcore.so");
+        print_soinfos();
+    }
     return res;
 }
 
@@ -116,19 +120,26 @@ install_hook_name(android_os_Process_setArgV0, void, JNIEnv *env, jobject obj, j
     const char *pkgName = env->GetStringUTFChars(arg, nullptr);
     if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(pkgName, need_inject_pkg) == 0) {
         LOGD("pkgName: %s", pkgName);
-        void *handle = dlopen(need_inject_so, RTLD_NOW);
+        void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
-            return;
         } else {
             LOGD("inject so: %s", need_inject_so);
             send_msg();
+            if (is_hide) {
+                hide_soinfo(need_inject_so);
+                print_soinfos();
+            }
         }
     }
     env->ReleaseStringUTFChars(arg, pkgName);
     DobbyDestroy(selinux_android_setcontext);
     DobbyDestroy(android_os_Process_setArg);
     dlclose(dlopen(nullptr, RTLD_NOW));
+    if (is_hide) {
+        hide_soinfo("libtcore.so");
+        print_soinfos();
+    }
 }
 
 install_hook_name(fork, pid_t, void) {
@@ -159,6 +170,7 @@ extern "C"
 void ainject(const char *pkg, const char *so_path) {
     need_inject_pkg = strdup(pkg);
     need_inject_so = strdup(so_path);
+    is_hide = false;
     LOGD("ainject: %s %s", need_inject_pkg, need_inject_so);
 
     char *byte = reinterpret_cast<char *>(fork);
@@ -168,6 +180,13 @@ void ainject(const char *pkg, const char *so_path) {
         return;
     }
     install_hook_fork((void *) fork);
+}
+
+__attribute__ ((visibility ("default")))
+extern "C"
+void enable_hide() {
+    is_hide = true;
+    LOGD("hide soinfo enabled");
 }
 
 __attribute__ ((visibility ("default")))

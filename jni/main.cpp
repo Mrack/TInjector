@@ -58,6 +58,7 @@
 int g_pid = -1;
 const char *g_so_path = nullptr;
 bool g_hide = false;
+bool g_hide_beta = false;
 bool g_spawn = false;
 const char *g_package_name = nullptr;
 
@@ -486,7 +487,8 @@ void inject_module() {
         long addr = get_remote_addr(g_pid, (void *) fork);
         uint8_t bytes[8] = {0};
         ptrace_read(g_pid, addr, bytes, 8);
-        LOGD("fork: %hhx %hhx %hhx %hhx %hhx %hhx %hhx %hhx", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+        LOGD("fork: %hhx %hhx %hhx %hhx %hhx %hhx %hhx %hhx", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+             bytes[5],
              bytes[6], bytes[7]);
         //50 00 00 58 00 02 1f d6
         if (bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x58 &&
@@ -512,6 +514,7 @@ void inject_module() {
             auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
                                                                                                      handle,
                                                                                                      (const char *) sym_name);
+
             if (fun) {
                 LOGI("Injecting...");
                 void *remote_pkg = alloc_str(g_pid, g_package_name);
@@ -527,6 +530,21 @@ void inject_module() {
             }
 
             call_remote_function<void, void *>(free, g_pid, sym_name);
+
+
+
+            if (g_hide_beta) {
+                void *sym_name1 = alloc_str(g_pid, "enable_hide");
+                auto fun1 = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
+                                                                                                          handle,
+                                                                                                          (const char *) sym_name1);
+
+                if (fun1) {
+                    call_remote_call<void>(g_pid, (long) fun1, 0, nullptr);
+                }
+                call_remote_function<void, void *>(free, g_pid, sym_name1);
+            }
+
         }
         if (!g_spawn) {
             LOGI("Inject success.");
@@ -587,6 +605,7 @@ void show_help(const char *name) {
     LOGI("  -p <package name> <so path>  Inject so to the specified package.");
     LOGI("  -P <pid> <so path>           Inject so to the specified pid.");
     LOGI("  --hide                       Hide the injected module.");
+    LOGI("  --hide1                      Hide the injected module. (soinfo)");
     LOGI("  -h                           Show this help.");
     LOGI("  -f                           Spwan a new process and inject to it. only for android app.");
 }
@@ -606,6 +625,8 @@ int main(int argc, const char *argv[]) {
             g_so_path = argv[++i];
         } else if (strcmp(argv[i], "--hide") == 0) {
             g_hide = true;
+        } else if (strcmp(argv[i], "--hide1") == 0) {
+            g_hide_beta = true;
         } else if (strcmp(argv[i], "-h") == 0) {
             show_help(argv[0]);
             return 0;
