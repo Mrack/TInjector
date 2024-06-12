@@ -638,7 +638,7 @@ int main(int argc, const char *argv[]) {
 #if defined(__aarch64__)
         g_pid = get_pid("zygote64");
 #else
-        pid = get_pid("zygote");
+        g_pid = get_pid("zygote");
 #endif
         if (g_pid == -1) {
             LOGE("zygote process not found.");

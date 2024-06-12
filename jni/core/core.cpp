@@ -87,11 +87,23 @@ void send_msg() {
     close(sockfd);
 }
 
+void unhook() {
+    DobbyDestroy((void *) fork);
+    DobbyDestroy((void *) vfork);
+
+    DobbyDestroy(selinux_android_setcontext);
+    DobbyDestroy(android_os_Process_setArg);
+}
+
+
 install_hook_name(selinux_android_setcontext, int, uid_t uid, bool isSystemServer, const char *seinfo,
                   const char *name) {
+    LOGD("selinux_android_setcontext %s", name);
+
     int res = orig_selinux_android_setcontext(uid, isSystemServer, seinfo, name);
     if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(name, need_inject_pkg) == 0) {
         LOGD("pkgName: %s", name);
+        unhook();
         void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
@@ -103,10 +115,9 @@ install_hook_name(selinux_android_setcontext, int, uid_t uid, bool isSystemServe
                 print_soinfos();
             }
         }
+
     }
 
-    DobbyDestroy(selinux_android_setcontext);
-    DobbyDestroy(android_os_Process_setArg);
     dlclose(dlopen(nullptr, RTLD_NOW));
     if (is_hide) {
         hide_soinfo("libtcore.so");
@@ -116,10 +127,12 @@ install_hook_name(selinux_android_setcontext, int, uid_t uid, bool isSystemServe
 }
 
 install_hook_name(android_os_Process_setArgV0, void, JNIEnv *env, jobject obj, jstring arg) {
+    LOGD("android_os_Process_setArgV0 %s", arg);
     orig_android_os_Process_setArgV0(env, obj, arg);
     const char *pkgName = env->GetStringUTFChars(arg, nullptr);
     if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(pkgName, need_inject_pkg) == 0) {
         LOGD("pkgName: %s", pkgName);
+        unhook();
         void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
@@ -133,8 +146,6 @@ install_hook_name(android_os_Process_setArgV0, void, JNIEnv *env, jobject obj, j
         }
     }
     env->ReleaseStringUTFChars(arg, pkgName);
-    DobbyDestroy(selinux_android_setcontext);
-    DobbyDestroy(android_os_Process_setArg);
     dlclose(dlopen(nullptr, RTLD_NOW));
     if (is_hide) {
         hide_soinfo("libtcore.so");
@@ -145,7 +156,6 @@ install_hook_name(android_os_Process_setArgV0, void, JNIEnv *env, jobject obj, j
 install_hook_name(fork, pid_t, void) {
     pid_t pid = orig_fork();
     if (pid == 0) {
-        DobbyDestroy((void *) fork);
         LOGD("fork %d", getpid());
         android_os_Process_setArg = DobbySymbolResolver("libandroid_runtime.so",
                                                         "_Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring");
@@ -159,10 +169,16 @@ install_hook_name(fork, pid_t, void) {
         if (selinux_android_setcontext) {
             install_hook_selinux_android_setcontext((void *) selinux_android_setcontext);
         } else {
-            LOGE("android_os_Process_setArgV0 is null");
+            LOGE("selinux_android_setcontext is null");
         }
     }
     return pid;
+}
+
+
+install_hook_name(vfork, pid_t, void) {
+    LOGD("vfork");
+    return fake_fork();
 }
 
 __attribute__ ((visibility ("default")))
@@ -180,6 +196,7 @@ void ainject(const char *pkg, const char *so_path) {
         return;
     }
     install_hook_fork((void *) fork);
+    install_hook_vfork((void *) vfork);
 }
 
 __attribute__ ((visibility ("default")))
@@ -193,12 +210,12 @@ __attribute__ ((visibility ("default")))
 extern "C"
 void unload() {
     LOGD("unload");
-    DobbyDestroy((void *) fork);
+    unhook();
 }
 
 
 __attribute__((destructor()))
 void destroy_globals() {
     LOGD("destroy_globals");
-    DobbyDestroy((void *) fork);
+    unhook();
 }

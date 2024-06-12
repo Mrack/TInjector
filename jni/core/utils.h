@@ -41,13 +41,17 @@ int search_hex(u_char *haystack, size_t haystackLen, const char *needle);
 
 void *get_address_from_module(const char *module_path, const char *symbol_name);
 
+std::string hexdump(const uint8_t *buf, size_t len);
+
+char *get_package_name();
 
 class JavaEnv {
 public:
     JavaEnv() {
         if (gVm == nullptr) {
             jsize num_vms;
-            auto JNI_GetCreatedJavaVMs =  (jint (*)(JavaVM **, jsize, jsize *)) get_address_from_module(find_path_from_maps("libart.so"), "GetCreatedJavaVMs");
+            auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) get_address_from_module(
+                    find_path_from_maps("libart.so"), "GetCreatedJavaVMs");
             jint status = JNI_GetCreatedJavaVMs(&gVm, 1, &num_vms);
             if (status != JNI_OK || num_vms == 0) {
                 gVm = nullptr;

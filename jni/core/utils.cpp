@@ -3,8 +3,55 @@
 //
 #include "utils.h"
 #include "elfio/elfio.hpp"
+#include "sstream"
 
 JavaVM *gVm = nullptr;
+
+
+std::string hexdump(const uint8_t *buf, size_t len) {
+    const size_t kBytesPerLine = 16;
+    std::stringstream output;
+
+    for (size_t i = 0; i < len; i += kBytesPerLine) {
+        // 打印地址
+        output << std::hex << std::setw(8) << std::setfill('0') << i << "  ";
+
+        // 打印十六进制数据
+        for (size_t j = 0; j < kBytesPerLine; ++j) {
+            if (i + j < len) {
+                output << std::hex << std::setw(2) << std::setfill('0')
+                       << static_cast<int>(static_cast<uint8_t>(buf[i + j])) << " ";
+            } else {
+                output << "   ";
+            }
+        }
+
+        // 打印 ASCII 字符
+        output << "  |";
+        for (size_t j = 0; j < kBytesPerLine; ++j) {
+            if (i + j < len) {
+                char c = buf[i + j];
+                output << (std::isprint(c) ? c : '.');
+            } else {
+                output << " ";
+            }
+        }
+        output << "|" << std::endl;
+    }
+    return output.str();
+}
+
+char *get_package_name() {
+    char *package_name = nullptr;
+    FILE *fp = fopen("/proc/self/cmdline", "r");
+    if (fp != nullptr) {
+        char cmdline[256] = {0};
+        fread(cmdline, 1, sizeof(cmdline), fp);
+        fclose(fp);
+        package_name = strtok(cmdline, "\0");
+    }
+    return package_name;
+}
 
 const char *get_data_path(jobject context) {
     JavaEnv env;
@@ -141,6 +188,7 @@ int boyer_moore_search(u_char *haystack, size_t haystackLen, u_char *needle, siz
 void *get_address_from_module(const char *module_path, const char *symbol_name) {
     ELFIO::elfio elffile;
     std::string name;
+
     ELFIO::Elf64_Addr value;
     ELFIO::Elf_Xword size;
     unsigned char bind;
@@ -178,7 +226,8 @@ void *get_address_from_module(const char *module_path, const char *symbol_name) 
     for (const auto &segment: elffile.segments) {
         if (offset >= segment->get_offset() &&
             offset <= segment->get_offset() + segment->get_file_size()) {
-            return (void *) (module_base + offset - (segment->get_virtual_address() - segment->get_offset()));
+            ELFIO::Elf64_Addr address = module_base + offset;
+            return (void *) address;
         }
     }
     return nullptr;

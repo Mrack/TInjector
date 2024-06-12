@@ -38,6 +38,13 @@ using Elf32_Off  = uint32_t;
 using Elf64_Addr = uint64_t;
 using Elf64_Off  = uint64_t;
 
+#if not defined(__aarch64__)
+#define Elf64_Addr Elf32_Addr
+#define Elf64_Half Elf32_Half
+#define Elf64_Off Elf32_Off
+#define Elf64_Sword Elf32_Sword
+#endif
+
 using Elf32_Half  = Elf_Half;
 using Elf64_Half  = Elf_Half;
 using Elf32_Word  = Elf_Word;
