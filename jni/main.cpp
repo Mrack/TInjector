@@ -20,6 +20,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <future>
+#include <iostream>
+#include <queue>
+#include <unordered_map>
+
 #include "core/json.hpp"
 
 #define PORT 56832
@@ -60,6 +64,17 @@ const char *g_so_path = nullptr;
 bool g_hide = false;
 bool g_hide_beta = false;
 bool g_spawn = false;
+bool g_inject_all = false;
+bool run_server_flag = true;
+uid_t g_uid = 0;
+void *handle;
+std::queue<pid_t> hooked_pid_queue;
+std::mutex mtx;
+std::mutex pid_mtx;
+std::condition_variable cv;
+int sockfd = 0, newsockfd = 0;
+int sigflag = 1111;
+std::unordered_map<pid_t, std::string> hooked_pids_map;
 const char *g_package_name = nullptr;
 
 long get_module_base(pid_t pid, const char *module_name) {
@@ -122,6 +137,15 @@ const char *get_module_name(pid_t pid, uintptr_t addr) {
     return "";
 }
 
+bool is_pid_alive(int pid) {
+    if (kill(pid, 0) == 0) {
+        return true;
+    } else if (errno == ESRCH) {
+        return false;
+    }
+    return false;
+}
+
 long get_remote_addr(int pid, void *func) {
     const char *module = get_module_name(-1, (uintptr_t) func);
     long local_base = get_module_base(-1, module);
@@ -170,7 +194,30 @@ int get_pid(const char *process_name) {
     }
     return -1;
 }
-
+// get package's uid by pm cmd
+uid_t get_uid(const char *packagename) {
+    const char *cmd = "pm list packages -U -3";
+    FILE *fp = popen(cmd, "r");
+    if (fp == nullptr) {
+        std::cerr << "Failed to run cmd" << std::endl;
+        return -1;
+    }
+    char buff[256];
+    uid_t uid = 0;
+    while (fgets(buff, sizeof(buff), fp) != nullptr) {
+        std::string line(buff);
+        if (line.find(packagename) != std::string::npos) {
+            std::size_t pos = line.find("uid:");
+            if (pos != std::string::npos) {
+                std::string uidstr = line.substr(pos + 4);
+                uid = std::stoi(uidstr);
+                break;
+            }
+        }
+    }
+    pclose(fp);
+    return uid;
+}
 
 long xptrace(int __request, ...) {
     va_list args;
@@ -203,7 +250,6 @@ void ptrace_read(int pid, long address, uint8_t *buffer, size_t size) {
         auto *byte = (unsigned char *) &word;
         *p++ = *byte;
     }
-
 }
 
 void ptrace_write(pid_t pid, long address, void *data, size_t size) {
@@ -303,6 +349,12 @@ void *alloc_str(int pid, const char *str) {
     return address;
 }
 
+void *alloc_int(int pid, uid_t value) {
+    void *address = call_remote_function<void *, size_t>(malloc, pid, sizeof(uid_t));
+    ptrace_write(pid, (long)address, (void *)&value, sizeof(uid_t));
+    return address;
+}
+
 struct map_info {
     long start;
     long end;
@@ -388,16 +440,158 @@ void hide_module(pid_t pid, const char *module_name) {
     fclose(fp);
 }
 
-void run_server(std::promise<int> &promiseObj) {
+void handle_sigint(int sig) {
+    if (sig == 2) {
+        sigflag = -1113;
+    }
+}
+
+void handle_receive_signal() {
+
+}
+
+void release_resources(int sig) {
+    std::string leave_msg;
+    if (sig == -1111) {
+        leave_msg = "Clearing&Exiting...";
+    } else if (sig == -1112) {
+        leave_msg = "Processes has fully quit, Clearing&Exiting...";
+    } else if (sig == -1113) {
+        leave_msg = "Caught SIGINT (Ctrl+C)! Gracefully handling...";
+    } else {
+        leave_msg = "Received signal " + std::to_string(sig) +", exiting...";
+    }
+    LOGI("%s", leave_msg.c_str());
+    // stop server
+    run_server_flag = false;
+    close(sockfd);
+    close(newsockfd);
+    // Release resources And Unhook zygote or target process
+    kill(g_pid, SIGCONT);
+    xptrace(PTRACE_ATTACH, g_pid, NULL, NULL);
+    void *sym_name = alloc_str(g_pid, "unload");
+    auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
+                                                                                             handle, (const char *) sym_name);
+    if (fun) {
+        call_remote_call<void>(g_pid, (long) fun, 0, nullptr);
+    }
+    call_remote_function<void, void *>(free, g_pid, sym_name);
+    call_remote_function<int, void *>(dlclose, g_pid, handle);
+    xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
+    setenforce(true);
+    exit(EXIT_SUCCESS);
+}
+
+// Listen to the port
+void run_server_listen() {
+    char buffer[1024];
+    while (run_server_flag) {
+        start:
+        // check SIG
+        {
+            if (sigflag == -1113) {
+                release_resources(-1113);
+            }
+        }
+        // check are processes all dead
+        {
+            bool leave_flag = false;
+            for(auto it = hooked_pids_map.begin(); it != hooked_pids_map.end(); ++it) {
+                if (is_pid_alive(it->first)) {
+                    leave_flag = true;
+                } else {
+                    if (it->second != "DEAD_DAD_DAED") {
+                        LOGI("Process: %d %s was dead", it->first, it->second.c_str());
+                        hooked_pids_map[it->first] = "DEAD_DAD_DAED";
+                    }
+                }
+            }
+            if (!leave_flag && !hooked_pids_map.empty()) {
+                release_resources(-1112);
+            }
+        }
+        socklen_t client_len;
+        struct sockaddr_in server_addr{}, client_addr{};
+
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            perror("socket");
+            exit(1);
+        }
+        struct pack {
+            size_t length;
+            char *data;
+        } pack{};
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(PORT);
+
+        int reuse = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        // there is a timeout mechanism existing and the server listens continuously,
+        // an error will be thrown at the `accept` function due to the timeout.
+        struct timeval timeout{};
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof(timeout));
+
+        if (HANDLE_EINTR(bind(sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr))) < 0) {
+            perror("bind");
+            goto err;
+        }
+
+        if (HANDLE_EINTR(listen(sockfd, 1)) < 0) {
+            perror("listen");
+            goto err;
+        }
+
+        client_len = sizeof(client_addr);
+        newsockfd = HANDLE_EINTR(accept(sockfd, (struct sockaddr *) &client_addr, &client_len));
+        if (newsockfd < 0) {
+            // perror("accept");
+            // LOGI("The error is", errno);
+            goto err;
+        }
+
+        while (run_server_flag) {
+            memset(buffer, 0, 1024);
+            ssize_t bytesReceived = recv(newsockfd, buffer, sizeof(buffer), 0);
+            if (bytesReceived < 0) {
+                perror("recv");
+                goto err;
+            } else if (bytesReceived == 0) {
+                LOGI("Connection closed by peer");
+                goto err;
+            } else {
+                nlohmann::json j = nlohmann::json::parse(buffer);
+                LOGI("Received: %s", j.dump().c_str());
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    hooked_pid_queue.push(j["pid"]);
+                    hooked_pids_map[j["pid"]] = std::string(j["pkg"]);
+                }
+            }
+            goto clear;
+        }
+    }
+    clear:
+    close(newsockfd);
+    close(sockfd);
+    goto start;
+
+    err:
+    goto clear;
+}
+
+// only Run OneTime
+void run_server() {
     int sockfd = 0, newsockfd = 0;
     socklen_t client_len;
+    ssize_t bytesReceived = -1;
     struct sockaddr_in server_addr{}, client_addr{};
-    ssize_t totalBytesReceived = 0;
 
-    struct pack {
-        size_t length;
-        char *data;
-    } pack{};
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
@@ -435,38 +629,31 @@ void run_server(std::promise<int> &promiseObj) {
         goto err;
     }
 
-    if (HANDLE_EINTR(recv(newsockfd, &pack.length, sizeof(pack.length), 0)) < 0) {
+    char buffer[1024];
+    memset(buffer, 0, 1024);
+    bytesReceived = recv(newsockfd, buffer, sizeof(buffer), 0);
+    if (bytesReceived < 0) {
         perror("recv");
         goto err;
-    }
-
-    pack.data = new char[pack.length];
-
-    while (true) {
-        ssize_t numBytesReceived = HANDLE_EINTR(
-                recv(newsockfd, pack.data + totalBytesReceived, pack.length - totalBytesReceived, 0));
-        if (numBytesReceived > 0) {
-            totalBytesReceived += numBytesReceived;
-        } else if (totalBytesReceived >= pack.length) {
-            nlohmann::json j = nlohmann::json::parse(pack.data);
-            LOGI("Received: %s", j.dump().c_str());
-            promiseObj.set_value(j["pid"]);
-            break;
-        } else {
-            perror("recv failed");
-            goto err;
+    } else if (bytesReceived == 0) {
+        LOGI("Connection closed by peer");
+        goto err;
+    } else {
+        nlohmann::json j = nlohmann::json::parse(buffer);
+        LOGI("Received: %s", j.dump().c_str());
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            hooked_pid_queue.push(j["pid"]);
         }
-
+        goto clear;
     }
 
     clear:
     close(newsockfd);
     close(sockfd);
-    delete pack.data;
     return;
 
     err:
-    promiseObj.set_value(-1);
     goto clear;
 }
 
@@ -499,9 +686,9 @@ void inject_module() {
     }
 
     void *address = alloc_str(g_pid, path);
-    LOGI("Injecting %s into %d", path, g_pid);
+    LOGI("Injecting %s into %d, %d", path, g_pid, g_hide);
 
-    auto handle = call_remote_function<void *, const char *, int>(dlopen, g_pid, (const char *) address,
+    handle = call_remote_function<void *, const char *, int>(dlopen, g_pid, (const char *) address,
                                                                   RTLD_NOW | RTLD_GLOBAL);
 
     call_remote_function<void, void *>(free, g_pid, address);
@@ -510,6 +697,17 @@ void inject_module() {
 
     if (handle) {
         if (g_spawn) {
+            if (g_inject_all) {
+                void *sym_name = alloc_str(g_pid, "enable_inject_all_proc");
+                auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
+                                                                                                          handle,
+                                                                                                          (const char *) sym_name);
+                if (fun) {
+                    call_remote_call<void>(g_pid, (long) fun, 0, nullptr);
+                }
+                call_remote_function<void, void *>(free, g_pid, sym_name);
+
+            }
             void *sym_name = alloc_str(g_pid, "ainject");
             auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
                                                                                                      handle,
@@ -519,19 +717,19 @@ void inject_module() {
                 LOGI("Injecting...");
                 void *remote_pkg = alloc_str(g_pid, g_package_name);
                 void *remote_so = alloc_str(g_pid, g_so_path);
+                void *remote_uid = alloc_int(g_pid, g_uid);
 
-                long params[] = {(long) remote_pkg, (long) remote_so};
-                call_remote_call<void>(g_pid, (long) fun, 2, (long *) &params);
+                long params[] = {(long) remote_pkg, (long) remote_so, (long) remote_uid};
+                call_remote_call<void>(g_pid, (long) fun, 3, (long *) &params);
 
                 call_remote_function<void, void *>(free, g_pid, remote_pkg);
                 call_remote_function<void, void *>(free, g_pid, remote_so);
+                call_remote_function<void, void *>(free, g_pid, remote_uid);
             } else {
                 LOGE("not found ainject");
             }
 
             call_remote_function<void, void *>(free, g_pid, sym_name);
-
-
 
             if (g_hide_beta) {
                 void *sym_name1 = alloc_str(g_pid, "enable_hide");
@@ -559,44 +757,45 @@ void inject_module() {
 
     xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
     if (g_spawn) {
-        std::promise<int> promiseObj;
-        std::thread serv(run_server, std::ref(promiseObj));
+        std::thread serv;
+        if (g_inject_all) {
+            serv = std::thread(run_server_listen);
+        } else {
+            serv = std::thread(run_server);
+        }
+
         system(std::string("am force-stop ").append(g_package_name).c_str());
         system(std::string("am start -D $(cmd package resolve-activity --brief '").append(g_package_name).append(
                 "'| tail -n 1)").c_str());
         serv.join();
         LOGD("Waiting for client connection...");
-        int child_pid = promiseObj.get_future().get();
-        if (child_pid > 0) {
-            if (g_hide) {
-                xptrace(PTRACE_ATTACH, child_pid, NULL, NULL);
-                LOGI("Hiding app module...");
-                hide_module(child_pid, g_so_path);
-                xptrace(PTRACE_DETACH, child_pid, NULL, NULL);
+        while (true) {
+            pid_t child_pid = -1;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, []{return !hooked_pid_queue.empty();});
+                child_pid = hooked_pid_queue.front();
+                hooked_pid_queue.pop();
+                if (child_pid > 0) {
+                    if (g_hide) {
+                        xptrace(PTRACE_ATTACH, child_pid, NULL, NULL);
+                        LOGI("Hiding app module...");
+                        hide_module(child_pid, g_so_path);
+                        xptrace(PTRACE_DETACH, child_pid, NULL, NULL);
+                    }
+
+                    LOGI("Inject %d success.", child_pid);
+                } else if (child_pid == -1) {
+                    LOGE("Inject failed. Failed to connect to client.");
+                    release_resources(-1111);
+                }
+                if (!g_inject_all) {
+                    release_resources(-1111);
+                    break;
+                }
             }
-
-            LOGI("Inject success.");
-        } else if (child_pid == -1) {
-            LOGE("Inject failed. Failed to connect to client.");
         }
-
-
-
-        // 释放资源
-        kill(g_pid, SIGCONT);
-        xptrace(PTRACE_ATTACH, g_pid, NULL, NULL);
-        void *sym_name = alloc_str(g_pid, "unload");
-        auto fun = (void (*)(void *, void *)) call_remote_function<void *, void *, const char *>(dlsym, g_pid,
-                                                                                                 handle,
-                                                                                                 (const char *) sym_name);
-        if (fun) {
-            call_remote_call<void>(g_pid, (long) fun, 0, nullptr);
-        }
-        call_remote_function<void, void *>(free, g_pid, sym_name);
-        call_remote_function<int, void *>(dlclose, g_pid, handle);
-        xptrace(PTRACE_DETACH, g_pid, NULL, NULL);
     }
-
 }
 
 void show_help(const char *name) {
@@ -606,6 +805,7 @@ void show_help(const char *name) {
     LOGI("  -P <pid> <so path>           Inject so to the specified pid.");
     LOGI("  --hide                       Hide the injected module.");
     LOGI("  --hide1                      Hide the injected module. (soinfo)");
+    LOGI("  --all                           Inject all process");
     LOGI("  -h                           Show this help.");
     LOGI("  -f                           Spwan a new process and inject to it. only for android app.");
 }
@@ -632,8 +832,11 @@ int main(int argc, const char *argv[]) {
             return 0;
         } else if (strcmp(argv[i], "-f") == 0) {
             g_spawn = true;
+        } else if (strcmp(argv[i], "--all") == 0) {
+            g_inject_all = true;
         }
     }
+    signal(SIGINT, handle_sigint);
     if (g_spawn) {
 #if defined(__aarch64__)
         g_pid = get_pid("zygote64");
@@ -656,6 +859,8 @@ int main(int argc, const char *argv[]) {
         LOGE("package name is required when using -f option.");
         return -1;
     }
+
+    g_uid = get_uid(g_package_name);
 
     if (g_spawn) {
         char v[128] = {0};

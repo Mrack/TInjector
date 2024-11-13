@@ -9,6 +9,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <set>
 #include "dobby/dobby.h"
 #include "json.hpp"
 #include "hide.h"
@@ -27,14 +28,16 @@
     __result; \
 })
 
-
+std::set<pid_t> hookedpids;
 void *android_os_Process_setArg = nullptr;
 void *selinux_android_setcontext = nullptr;
 char *need_inject_pkg = nullptr;
 char *need_inject_so = nullptr;
+uid_t need_inject_uid = 0;
 bool is_hide = false;
+bool is_inject_all = false;
 
-void send_msg() {
+void send_msg(const char* name) {
     int sockfd;
     struct sockaddr_in server_addr{};
 
@@ -65,19 +68,20 @@ void send_msg() {
 
     nlohmann::json j;
     j["pid"] = getpid();
-    j["pkg"] = need_inject_pkg;
+    j["pkg"] = name;
     j["so"] = need_inject_so;
+    j["uid"] = need_inject_uid;
 
 
     std::string s = j.dump();
     const char *message = s.c_str();
+    // the message is so short to send the length
+    // size_t len = strlen(message);
 
-    size_t len = strlen(message);
-
-    if (HANDLE_EINTR(send(sockfd, &len, sizeof(size_t), 0)) < 0) {
-        LOGD("send: %s", strerror(errno));
-        exit(1);
-    }
+    // if (HANDLE_EINTR(send(sockfd, &len, sizeof(size_t), 0)) < 0) {
+    //     LOGD("send: %s", strerror(errno));
+    //     exit(1);
+    // }
 
     if (HANDLE_EINTR(send(sockfd, message, strlen(message), 0)) < 0) {
         LOGD("send: %s", strerror(errno));
@@ -87,7 +91,7 @@ void send_msg() {
     close(sockfd);
 }
 
-void unhook() {
+void unhookall() {
     DobbyDestroy((void *) fork);
     DobbyDestroy((void *) vfork);
 
@@ -95,29 +99,36 @@ void unhook() {
     DobbyDestroy(android_os_Process_setArg);
 }
 
+void unhookfunc() {
+    DobbyDestroy(selinux_android_setcontext);
+    DobbyDestroy(android_os_Process_setArg);
+}
+
+bool setenforce(bool value) {
+    int ret = system(value ? "setenforce 1" : "setenforce 0");
+    return ret == 0;
+}
+
 
 install_hook_name(selinux_android_setcontext, int, uid_t uid, bool isSystemServer, const char *seinfo,
                   const char *name) {
     LOGD("selinux_android_setcontext %s", name);
-
     int res = orig_selinux_android_setcontext(uid, isSystemServer, seinfo, name);
-    if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(name, need_inject_pkg) == 0) {
+    if (need_inject_pkg != nullptr && need_inject_so != nullptr && getuid() == need_inject_uid && ((!is_inject_all && strcmp(name, need_inject_pkg) == 0) || is_inject_all)) {
         LOGD("pkgName: %s", name);
-        unhook();
+        unhookfunc();
         void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
         } else {
             LOGD("inject so: %s", need_inject_so);
-            send_msg();
+            send_msg(name);
             if (is_hide) {
                 hide_soinfo(need_inject_so);
                 print_soinfos();
             }
         }
-
     }
-
     dlclose(dlopen(nullptr, RTLD_NOW));
     if (is_hide) {
         hide_soinfo("libtcore.so");
@@ -131,15 +142,15 @@ install_hook_name(android_os_Process_setArgV0, void, JNIEnv *env, jobject obj, j
     LOGD("android_os_Process_setArgV0 %s", c_arg);
     orig_android_os_Process_setArgV0(env, obj, arg);
     const char *pkgName = env->GetStringUTFChars(arg, nullptr);
-    if (need_inject_pkg != nullptr && need_inject_so != nullptr && strcmp(pkgName, need_inject_pkg) == 0) {
+    if (need_inject_pkg != nullptr && need_inject_so != nullptr && getuid() == need_inject_uid && ((!is_inject_all && strcmp(pkgName, need_inject_pkg) == 0) || is_inject_all)) {
         LOGD("pkgName: %s", pkgName);
-        unhook();
+        unhookfunc();
         void *handle = dlopen(need_inject_so, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL);
         if (handle == nullptr) {
             LOGE("dlopen failed: %s", dlerror());
         } else {
             LOGD("inject so: %s", need_inject_so);
-            send_msg();
+            send_msg(pkgName);
             if (is_hide) {
                 hide_soinfo(need_inject_so);
                 print_soinfos();
@@ -184,12 +195,12 @@ install_hook_name(vfork, pid_t, void) {
 
 __attribute__ ((visibility ("default")))
 extern "C"
-void ainject(const char *pkg, const char *so_path) {
+void ainject(const char *pkg, const char *so_path, const uid_t* uid) {
     need_inject_pkg = strdup(pkg);
     need_inject_so = strdup(so_path);
+    need_inject_uid = *uid;
     is_hide = false;
-    LOGD("ainject: %s %s", need_inject_pkg, need_inject_so);
-
+    LOGD("ainject: %s %s %d", need_inject_pkg, need_inject_so, need_inject_uid);
     char *byte = reinterpret_cast<char *>(fork);
     if (byte[1] == 0x00 && byte[2] == 0x00 && byte[3] == 0x58 && byte[4] == 0x00 &&
         byte[5] == 0x02 && byte[6] == 0x1f && byte[7] == 0xd6) {
@@ -209,14 +220,21 @@ void enable_hide() {
 
 __attribute__ ((visibility ("default")))
 extern "C"
+void enable_inject_all_proc() {
+    is_inject_all = true;
+}
+
+__attribute__ ((visibility ("default")))
+extern "C"
 void unload() {
     LOGD("unload");
-    unhook();
+    unhookall();
+    setenforce(true);
 }
 
 
 __attribute__((destructor()))
 void destroy_globals() {
     LOGD("destroy_globals");
-    unhook();
+    unhookall();
 }
